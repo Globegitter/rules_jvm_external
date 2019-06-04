@@ -442,6 +442,22 @@ def _cat_file(repository_ctx, filepath):
         fail("Error while trying to read %s: %s" % (filepath, exec_result.stderr))
     return exec_result.stdout
 
+def _cleanup_line(repository_ctx, line):
+    bash = repository_ctx.os.environ.get("BAZEL_SH") or "bash"
+    exec_result = repository_ctx.execute([bash, "-c", "echo \"%s\" | sed -e 's/[ └─│├\]//g' | tr -d '\n'" % line], quiet=True)
+    if exec_result.return_code != 0:
+        fail("Unable to clean up line: " + exec_result.stderr)
+    return exec_result.stdout
+
+def _artifact_to_url(artifact):
+    # artifact of pattern: org.springframework.boot:spring-boot:2.1.3.RELEASE
+    # url: http://central.maven.org/maven2/org/springframework/boot/spring-boot/2.1.5.RELEASE/spring-boot-2.1.5.RELEASE.jar
+    parts = artifact.split(":")
+    jar = parts[1] + "-" + parts[2] + ".jar"
+    url_path = parts[0].replace(".", "/") + "/" + parts[1] + "/" + parts[2]
+    return "http://central.maven.org/maven2/" + url_path + "/" + jar
+
+
 def _coursier_fetch_impl(repository_ctx):
     # Download Coursier's standalone (deploy) jar from Maven repositories.
     repository_ctx.download([
@@ -498,12 +514,12 @@ def _coursier_fetch_impl(repository_ctx):
                                        ":".join([e["group"], e["artifact"]]))
 
     cmd = _generate_coursier_command(repository_ctx)
-    cmd.extend(["fetch"])
+    cmd.extend(["resolve", "-t"])
     cmd.extend(artifact_coordinates)
-    cmd.extend(["--artifact-type", ",".join(_COURSIER_PACKAGING_TYPES + ["src"])])
-    cmd.append("--quiet")
+    # cmd.extend(["--artifact-type", ",".join(_COURSIER_PACKAGING_TYPES + ["src"])])
+    # cmd.append("--quiet")
     cmd.append("--no-default")
-    cmd.extend(["--json-output-file", "dep-tree.json"])
+    # cmd.extend(["--json-output-file", "dep-tree.json"])
 
     if repository_ctx.attr.fail_on_missing_checksum:
         cmd.extend(["--checksum", "SHA-1,MD5"])
@@ -533,34 +549,80 @@ def _coursier_fetch_impl(repository_ctx):
     if (exec_result.return_code != 0):
         fail("Error while fetching artifact with coursier: " + exec_result.stderr)
 
+    # print(exec_result.stdout)
+    out_lines = exec_result.stdout.splitlines()
+    dep_tree_res = {
+        "dependencies": [],
+    }
+    dep_i = -1
+    for line in out_lines:
+        if line.startswith("├") or line.startswith("└"):
+            dep_i += 1
+            artifact = _cleanup_line(repository_ctx, line)
+            dep = {
+                "name": _escape(_strip_packaging_and_classifier_and_version(artifact)),
+                "artifact": artifact,
+                "dependencies": [],
+            }
+            dep_tree_res["dependencies"].append(dep)
+        else:
+            dep_tree_res["dependencies"][dep_i]["dependencies"].append(_escape(_strip_packaging_and_classifier_and_version(_cleanup_line(repository_ctx, line))))
+
+    target_import_string = []
+    all_imports = []
+
+    for dep in dep_tree_res["dependencies"]:
+
+        target_import_string.append("\thttp_file(")
+        target_import_string.append("\t\tname = \"%s\"," % dep["name"])
+        target_import_string.append("\t\turls = [\"%s\"]," % _artifact_to_url(dep["artifact"]))
+        target_import_string.append("\t)")
+        all_imports.append("\n".join(target_import_string))
+
+    content = "\n".join(all_imports)
+
+    repository_ctx.file(
+        "maven.bzl",
+        """
+load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
+
+def download_deps():
+%s
+        """ % content,
+        executable = False,
+    )
+
+
+
+
     # Once coursier finishes a fetch, it generates a tree of artifacts and their
     # transitive dependencies in a JSON file. We use that as the source of truth
     # to generate the repository's BUILD file.
-    dep_tree = json_parse(_cat_file(repository_ctx, "dep-tree.json"))
+    # dep_tree = json_parse(_cat_file(repository_ctx, "dep-tree.json"))
 
-    neverlink_artifacts = {a["group"] + ":" + a["artifact"]: True for a in artifacts if a.get("neverlink", False)}
-    repository_ctx.report_progress("Generating BUILD targets..")
-    generated_imports = generate_imports(
-        repository_ctx = repository_ctx,
-        dep_tree = dep_tree,
-        neverlink_artifacts = neverlink_artifacts,
-    )
+    # neverlink_artifacts = {a["group"] + ":" + a["artifact"]: True for a in artifacts if a.get("neverlink", False)}
+    # repository_ctx.report_progress("Generating BUILD targets..")
+    # generated_imports = generate_imports(
+    #     repository_ctx = repository_ctx,
+    #     dep_tree = dep_tree,
+    #     neverlink_artifacts = neverlink_artifacts,
+    # )
 
-    repository_ctx.template(
-        "jvm_import.bzl",
-        repository_ctx.attr._jvm_import,
-        substitutions = {},
-        executable = False,  # not executable
-    )
+    # repository_ctx.template(
+    #     "jvm_import.bzl",
+    #     repository_ctx.attr._jvm_import,
+    #     substitutions = {},
+    #     executable = False,  # not executable
+    # )
 
-    repository_ctx.file(
-        "BUILD",
-        _BUILD.format(
-            repository_name = repository_ctx.name,
-            imports = generated_imports,
-        ),
-        False,  # not executable
-    )
+    # repository_ctx.file(
+    #     "BUILD",
+    #     _BUILD.format(
+    #         repository_name = repository_ctx.name,
+    #         imports = generated_imports,
+    #     ),
+    #     False,  # not executable
+    # )
 
 coursier_fetch = repository_rule(
     attrs = {
